@@ -13,6 +13,7 @@ uses
   ChakraCore,
   ChakraCoreUtils,
   ChakraRTTIObject,
+  ChakraEventObject,
   chakrainstance,
   chakraevents,
   epollsockets,
@@ -20,7 +21,6 @@ uses
   webserver;
 
 type
-  //TOpenSSLBesenWorkAroundThread = class(TThread)
   { TChakraWebsocketClient }
 
   { client object - this is created automatically for each new connection and
@@ -29,14 +29,13 @@ type
     for regular http clients, .disconnect() must be called after the request
     has been processed. Otherwise the client will never receive a response
   }
-  TChakraWebsocketClient = class(TNativeRTTIObject)
+  TChakraWebsocketClient = class(TNativeRTTIEventObject)
   private
     FIsRequest: Boolean;
     FMimeType: string;
     FReply: string;
     FConnection: THTTPConnection;
     FReturnType: string;
-    FRefCounter: Integer;
     function GetHostname: string;
     function GetLag: Integer;
     function GetParameter: string;
@@ -47,8 +46,6 @@ type
     procedure SetPongTime(AValue: Integer);
   public
     constructor Create(Args: PJsValueRef = nil; ArgCount: Word = 0; AFinalize: Boolean = False); override;
-    procedure AddRefCount;
-    procedure DecRefCount;
   published
     { send(data) - sends data to client }
     function send(Arguments: PJsValueRefArray; CountArguments: word): JsValueRef;
@@ -80,26 +77,13 @@ type
   { TChakraWebsocketHandler }
 
   { global handler object for websocket scripts }
-  TChakraWebsocketHandler = class(TNativeRTTIObject)
+  TChakraWebsocketHandler = class(TNativeRTTIEventObject)
   private
-    //FOnConnect: TBESENObjectFunction;
-    //FOnData: TBESENObjectFunction;
-    //FOnDisconnect: TBESENObjectFunction;
-    //FOnRequest: TBESENObjectFunction;
     FUrl: string;
     FParentThread: TChakraWebsocket;
     function GetUnloadTimeout: Integer;
     procedure SetUnloadTimeout(AValue: Integer);
   published
-    (*
-    { onRequest = function(client) - callback function for an incoming regular http request }
-    property onRequest: TBESENObjectFunction read FOnRequest write FOnRequest;
-    { onConnect = function(client) - callback function for new incoming websocket connection }
-    property onConnect: TBESENObjectFunction read FOnConnect write FOnConnect;
-    { onData = function(client, data) - callback function for incoming websocket client data }
-    property onData: TBESENObjectFunction read FOnData write FOnData;
-    { onDisconnect = function(client) - callback function when a client disconnects }
-    property onDisconnect: TBESENObjectFunction read FOnDisconnect write FOnDisconnect; *)
     property url: string read FUrl;
     property unloadTimeout: Integer read GetUnloadTimeout write SetUnloadTimeout;
   end;
@@ -112,8 +96,6 @@ type
     FClients: array of TChakraWebsocketClient;
     function GetLength: Integer;
   protected
-    //procedure InitializeObject; override;
-    //procedure FinalizeObject; override;
     function RemoveClient(Client: TChakraWebsocketClient): Boolean;
   published
     { add(client) - add a websocket client into bulk send list }
@@ -122,14 +104,28 @@ type
     function remove(Arguments: PJsValueRefArray; CountArguments: word): JsValueRef;
     { send(data - send data to all clients in bulk send list}
     function send(Arguments: PJsValueRefArray; CountArguments: word): JsValueRef;
+    { disconnect all clients and remove from list }
+    function disconnectAll(Arguments: PJsValueRefArray; CountArguments: word): JsValueRef;
     { amount of clients in list }
     property count: Integer read GetLength;
+  end;
+
+  { TChakraDataEvent }
+
+  TChakraDataEvent = class(TChakraEvent)
+  private
+    FClient: TChakraWebsocketClient;
+    FData: string;
+  published
+    property client: TChakraWebsocketClient read FClient write FClient;
+    property data: string read FData write FData;
   end;
 
   { TChakraWebsocket }
 
   TChakraWebsocket = class(TEPollWorkerThread)
   private
+    FCS: TCriticalSection;
     FAutoUnload: Integer;
     FFilename: string;
     FSite: TWebserverSite;
@@ -139,21 +135,27 @@ type
     FIdleTicks,FGCTicks: Integer;
     FUrl: string;
     FFlushList: TObjectList;
+    FEnvVars: TFPStringHashTable;
   protected
-    procedure LoadBESEN;
-    procedure UnloadBESEN;
+    procedure LoadInstance;
+    procedure UnloadInstance;
     function GetClient(AClient: THTTPConnection): TChakraWebsocketClient;
     procedure ThreadTick; override;
     procedure AddConnection(Client: TEPollSocket);
     procedure ClientData(Sender: THTTPConnection; const data: string);
     procedure ClientDisconnect(Sender: TEPollSocket);
     procedure Initialize; override;
+    procedure Finalize; override;
   public
     constructor Create(aParent: TWebserver; ASite: TWebserverSite; AFile: string; Url: string);
     destructor Destroy; override;
     procedure AddConnectionToFlush(AConnection: THTTPConnection);
+    procedure RemoveWebsocketClient(Client: TChakraWebsocketClient);
+    procedure SetEnvVar(Name, Value: string);
+    function GetEnvVar(Name: string): string;
     property Site: TWebserverSite read FSite;
     property AutoUnload: Integer read FAutoUnload write FAutoUnload;
+    property Url: string read FUrl;
   end;
 
 implementation
@@ -266,6 +268,19 @@ begin
     RemoveClient(FClients[i]);
 end;
 
+function TChakraWebsocketBulkSender.disconnectAll(Arguments: PJsValueRefArray;
+  CountArguments: word): JsValueRef;
+var
+  i: Integer;
+begin
+  Result:=JsUndefinedValue;
+  for i:=0 to Length(FClients)-1 do
+  begin
+    FClients[i].FConnection.Close;
+  end;
+  Setlength(FClients, 0);
+end;
+
 { TChakraWebsocketHandler }
 
 function TChakraWebsocketHandler.GetUnloadTimeout: Integer;
@@ -283,6 +298,7 @@ end;
 constructor TChakraWebsocket.Create(aParent: TWebserver; ASite: TWebserverSite;
   AFile: string; Url: string);
 begin
+  FCS:=TCriticalSection.Create;
   FSite:=ASite;
   OnConnection:=@AddConnection;
   FFilename:=ASite.Path+'scripts/'+AFile;
@@ -290,14 +306,16 @@ begin
   FURL:=Url;
   FAutoUnload:=20000;
   FFlushList:=TObjectList.Create(False);
+  FEnvVars:=TFPStringHashTable.Create;
   inherited Create(aParent);
 end;
 
-destructor TChakraWebsocket.Destroy; 
+destructor TChakraWebsocket.Destroy;
 begin
-  inherited; 
-  UnloadBESEN;
+  inherited;
+  FCS.Free;
   FFlushList.Free;
+  FEnvVars.Free;
 end;
 
 procedure TChakraWebsocket.AddConnectionToFlush(AConnection: THTTPConnection);
@@ -306,43 +324,73 @@ begin
     FFLushList.Add(AConnection);
 end;
 
-procedure TChakraWebsocket.LoadBESEN;
+procedure TChakraWebsocket.RemoveWebsocketClient(Client: TChakraWebsocketClient);
+var
+  i: Integer;
 begin
-  dolog(llDebug, 'Loading Websocket Script at '+StripBasePath(FFilename));
+  for i:=0 to Length(FClients)-1 do
+  if FClients[i] = Client then
+  begin
+    FClients[i]:=FClients[Length(FClients)-1];
+    Setlength(FClients, Length(FClients) - 1);
+    Client.FConnection:=nil;
+    if Client.Release = 0 then
+      Client.Free;
+    Exit;
+  end;
+  raise Exception.Create('Websocket client not found');
+end;
+
+procedure TChakraWebsocket.SetEnvVar(Name, Value: string);
+begin
+  FCS.Enter;
+  try
+    FEnvVars[Name]:=Value;
+  finally
+    FCS.Leave;
+  end;
+end;
+
+function TChakraWebsocket.GetEnvVar(Name: string): string;
+begin
+  FCS.Enter;
+  try
+    Result:=FEnvVars[Name];
+  finally
+    FCS.Leave;
+  end;
+end;
+
+procedure TChakraWebsocket.LoadInstance;
+begin
+  dolog(llDebug, ['Loading Websocket Script at ', StripBasePath(FFilename)]);
   if Assigned(FInstance) then
     Exit;
 
   FInstance:=TChakraInstance.Create(FSite.Parent, FSite, self);
-  FHandler:=TChakraWebsocketHandler.Create();
-  //FHandler.InitializeObject;
+  FHandler:=TChakraWebsocketHandler.Create(nil, 0, True);
   FHandler.FUrl:=FUrl;
   FHandler.FParentThread:=Self;
 
-  //FInstance.GarbageCollector.Add(TChakraObject(FHandler));
-  //FInstance.GarbageCollector.Protect(TChakraObject(FHandler));
-
   JsSetProperty(FInstance.Context.Global, 'handler', FHandler.Instance);
-  //FInstance.ObjectGlobal.put('handler', BESENObjectValue(FHandler), false);
-
   TChakraWebsocketBulkSender.Project('BulkSender');
-  //FInstance.RegisterNativeObject('BulkSender', TChakraWebsocketBulkSender);
-  //FInstance.SetFilename(FFilename);
+
   try
     FInstance.ExecuteFile(FFilename);
   except
     on e: Exception do
-      FInstance.OutputException(e, 'websocket-init');
+      FInstance.SystemObject.HandleException(e, 'websocket-init');
   end;
 end;
 
-procedure TChakraWebsocket.UnloadBESEN;
+procedure TChakraWebsocket.UnloadInstance;
 var
   conn: THTTPConnection;
 begin
   if FInstance = nil then
     Exit;
 
-  dolog(llDebug, 'Unloading Websocket Script at '+StripBasePath(FFilename));
+  dolog(llDebug, ['Unloading Websocket Script at ', StripBasePath(FFilename)]);
 
   while Length(FClients)>0 do
   begin
@@ -354,8 +402,7 @@ begin
     end;
   end;
 
-  //FInstance.GarbageCollector.UnProtect(TChakraObject(FHandler));
-
+  FInstance.CollectGarbage;
   FInstance.Free;
   FInstance:=nil;
   FHandler:=nil;
@@ -365,9 +412,13 @@ procedure TChakraWebsocket.ClientData(Sender: THTTPConnection;
   const data: string);
 var
   client: TChakraWebsocketClient;
+  ev: TChakraDataEvent;
   //a: array[0..1] of PBESENValue;
   //v,v2, AResult: TChakraValue;
 begin
+  if (Sender.wsVersion = wvNone) or (Sender.wsVersion = wvDelayedRequest) then
+    raise Exception.Create('Bad state for client data');
+
   client:=GetClient(Sender);
 
   if not Assigned(client) then
@@ -377,17 +428,32 @@ begin
     Exit;
   end;
 
+  ev:=TChakraDataEvent.Create('data', False);
+  ev.data:=data;
+  ev.client:=client;
+  client.dispatchEvent(ev);
+  FHandler.dispatchEvent(ev);
+
   try
-     ExecuteCallback(FHandler, 'onData', [client.Instance, StringToJsString(data)]);
+    ExecuteCallback(FHandler, 'onData', [client.Instance, StringToJsString(data)]);
   except
     on e: Exception do
-      FInstance.OutputException(e, 'handler.onData');
+      FInstance.SystemObject.HandleException(e, 'handler.onData');
   end;
+
+  try
+    ExecuteCallback(FHandler, 'ondata', [ev.Instance]);
+  except
+    on e: Exception do
+    FInstance.SystemObject.HandleException(e, 'handler.ondata');
+  end;
+  ev.Free;
 end;
 
 procedure TChakraWebsocket.ClientDisconnect(Sender: TEPollSocket);
 var
   client: TChakraWebsocketClient;
+  ev: TChakraDataEvent;
   i: Integer;
 begin
   if not (Sender is THTTPConnection) then
@@ -400,34 +466,52 @@ begin
 
   if not client.FIsRequest then
   begin
+    ev:=TChakraDataEvent.Create('disconnect', False);
+    ev.data:='';
+    ev.client:=client;
+    client.dispatchEvent(ev);
+    FHandler.dispatchEvent(ev);
+
     try
-       ExecuteCallback(FHandler, 'onDisconnect', [FHandler.Instance, client.Instance]);
+       ExecuteCallback(FHandler, 'onDisconnect', [client.Instance]);
     except
       on e: Exception do
-        FInstance.OutputException(e, 'handler.onDisconnect');
+        FInstance.SystemObject.HandleException(e, 'handler.onDisconnect');
     end;
+
+    try
+       ExecuteCallback(FHandler, 'ondisconnect', [ev.Instance]);
+    except
+      on e: Exception do
+        FInstance.SystemObject.HandleException(e, 'handler.ondisconnect');
+    end;
+
+    ev.Free;
   end;
-  client.DecRefCount;
 
   i:=FFlushList.IndexOf(Sender);
   if i>=0 then
     FFlushList.Delete(i);
 
-  for i:=0 to Length(FClients)-1 do
-    if FClients[i] = client then
-    begin
-      FClients[i]:=FClients[Length(FClients)-1];
-      Setlength(FClients, Length(FClients)-1);
-      Break;
-    end;
-
-  client.FConnection:=nil;
+  RemoveWebsocketClient(client);
 end;
 
 procedure TChakraWebsocket.Initialize;
 begin
   inherited Initialize;
-  LoadBESEN;
+  LoadInstance;
+end;
+
+procedure TChakraWebsocket.Finalize;
+var
+  i: Integer;
+begin
+  inherited Finalize;
+  for i:=0 to Length(FClients)-1 do
+  begin
+    FClients[i].Free;
+  end;
+  UnloadInstance;
 end;
 
 function TChakraWebsocket.GetClient(AClient: THTTPConnection): TChakraWebsocketClient;
@@ -449,9 +533,8 @@ end;
 procedure TChakraWebsocket.AddConnection(Client: TEPollSocket);
 var
   i: Integer;
-  //a: PBESENValue;
-  //v: TChakraValue;
-  //AResult: TChakraValue;
+  eventsFired: Integer;
+  ev: TChakraDataEvent;
   aclient: TChakraWebsocketClient;
 begin
   if not Assigned(Client) then
@@ -461,43 +544,87 @@ begin
     Exit;
 
   if not Assigned(FInstance) then
-    LoadBESEN;
+    LoadInstance;
 
-  aclient:=TChakraWebsocketClient.Create();
-  //FInstance.GarbageCollector.Add(TChakraObject(aclient));
-
-  //aclient.InitializeObject;
-  aclient.AddRefCount;
+  aclient:=TChakraWebsocketClient.Create(nil, 0, True);
+  aclient.AddRef;
   aclient.FConnection:=THTTPConnection(Client);
   aclient.FConnection.OnWebsocketData:=@ClientData;
   aclient.FConnection.OnDisconnect:=@ClientDisconnect;
+  aclient.FIsRequest:=not aclient.FConnection.CanWebsocket;
 
-  //a:=@v;
   i:=Length(FClients);
   Setlength(FClients, i+1);
   FClients[i]:=aClient;
-  //v:=BESENObjectValue(aClient);
 
-  aclient.FIsRequest:=not aclient.FConnection.CanWebsocket;
   if aclient.FIsRequest then
   begin
+    ev:=TChakraDataEvent.Create('request', False);
+    ev.client:=aClient;
+    ev.data:='';
+    eventsFired:=JsNumberToInt(JsValueAsJsNumber(FHandler.dispatchEvent(ev)));
+
     try
-       ExecuteCallback(FHandler, 'onRequest', [FHandler.Instance, aClient.Instance]);
+       ExecuteCallback(FHandler, 'onRequest', [aClient.Instance]);
+       if (JsGetProperty(FHandler.Instance, 'onRequest') <> JsUndefinedValue) then
+         inc(eventsFired);
     except
       on e: Exception do
-        FInstance.OutputException(e, 'handler.onRequest');
+        FInstance.SystemObject.HandleException(e, 'handler.onRequest');
+    end;
+
+    try
+       ExecuteCallback(FHandler, 'onrequest', [ev.Instance]);
+       if (JsGetProperty(FHandler.Instance, 'onrequest') <> JsUndefinedValue) then
+         inc(eventsFired);
+    except
+      on e: Exception do
+        FInstance.SystemObject.HandleException(e, 'handler.onrequest');
+    end;
+    ev.Free;
+
+    if (eventsFired = 0) then
+    begin
+      if not Client.Closed then
+      begin
+        THTTPConnection(Client).SendStatusCode(404);
+        if THTTPConnection(Client).KeepAlive then
+        begin
+          aClient.FConnection:=nil;
+          THTTPConnection(Client).RelocateBack;
+        end else
+        begin
+          THTTPConnection(Client).Close;
+        end;
+      end;
     end;
   end else
   begin
     aclient.FConnection.UpgradeToWebsocket;
+
+    ev:=TChakraDataEvent.Create('connect', False);
+    ev.data:='';
+    ev.client:=aclient;
+    eventsFired:=JsNumberToInt(JsValueAsJsNumber(FHandler.dispatchEvent(ev)));
+
     try
-       ExecuteCallback(FHandler, 'onConnect', [FHandler.Instance, aClient.Instance]);
-      //if Assigned(FHandler.onConnect) then
-      //  FHandler.onConnect.Call(BESENObjectValue(FHandler), @a, 1, AResult);
+       ExecuteCallback(FHandler, 'onconnect', [ev.Instance]);
+       if (JsGetProperty(FHandler.Instance, 'onconnect') <> JsUndefinedValue) then
+         inc(eventsFired);
     except
       on e: Exception do
-        FInstance.OutputException(e, 'handler.onConnect');
+        FInstance.SystemObject.HandleException(e, 'handler.onconnect');
     end;
+
+    try
+       ExecuteCallback(FHandler, 'onConnect', [aClient.Instance]);
+       if (JsGetProperty(FHandler.Instance, 'onConnect') <> JsUndefinedValue) then
+         inc(eventsFired);
+    except
+      on e: Exception do
+        FInstance.SystemObject.HandleException(e, 'handler.onConnect');
+    end;
+    ev.Free;
   end;
 end;
 
@@ -526,7 +653,10 @@ begin
     else begin
       if FAutoUnload>0 then
       if FIdleTicks * EpollWaitTime > FAutoUnload then
-        UnloadBESEN
+      begin
+        FIdleTicks:=0;
+        UnloadInstance;
+      end
       else
         inc(FIdleTicks);
     end;
@@ -535,26 +665,6 @@ begin
 end;
 
 { TChakraWebsocketClient }
-
-procedure TChakraWebsocketClient.AddRefCount;
-begin
-  if FRefCounter = 0 then
-  begin
-    //TChakra(Instance).GarbageCollector.Protect(Self);
-  end;
-  Inc(FRefCounter);
-end;
-
-procedure TChakraWebsocketClient.DecRefCount;
-begin
-  Dec(FRefCounter);
-  if FRefCounter = 0 then
-  begin
-    //nTChakra(Instance).GarbageCollector.Unprotect(Self);
-  end else
-  if FRefCounter < 0 then
-    dolog(llWarning, 'Internal Error: Reference Counter in TChakraWebsocketClient is broken');
-end;
 
 function TChakraWebsocketClient.send(Arguments: PJsValueRefArray;
   CountArguments: word): JsValueRef;
@@ -615,16 +725,28 @@ end;
 
 function TChakraWebsocketClient.disconnect(Arguments: PJsValueRefArray;
   CountArguments: word): JsValueRef;
+var
+  ws: TChakraWebsocket;
 begin
   Result := JsUndefinedValue;
   if Assigned(FConnection) then
   begin
     if FIsRequest then
     begin
+      ws:=TChakraWebsocket(FConnection.Parent);
       FConnection.SendContent(FMimeType, FReply, FReturnType, not FConnection.IsSSL);
       if FConnection.IsSSL then
-       TChakraWebsocket(FConnection.Parent).AddConnectionToFlush(FConnection);
-    end;
+       ws.AddConnectionToFlush(FConnection);
+      if (not FConnection.Closed) and FConnection.KeepAlive then
+      begin
+           FConnection.RelocateBack;
+           FConnection:=nil;
+      end else
+      begin
+          FConnection.Close;
+      end;
+      ws.RemoveWebsocketClient(Self);
+    end else
     FConnection.Close;
   end;
 end;
@@ -693,7 +815,6 @@ begin
   FIsRequest:=False;
   FMimeType:='text/html';
   FReturnType:='200 OK';
-  FRefCounter:=0;
 end;
 
 function TChakraWebsocketClient.GetHostname: string;

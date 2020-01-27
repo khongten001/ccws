@@ -54,6 +54,7 @@ type
     procedure AddResponseHeader(const name, value: string);
     procedure AddHostAlias(HostName: string);
     procedure AddCustomHandler(url: string; Handler: TEpollWorkerThread);
+    procedure RemoveCustomHandler(url: string);
     procedure AddCustomStatusPage(StatusCode: Word; URI: string);
     procedure ApplyResponseHeader(const Response: THTTPReply);
     procedure AddWhiteListProcess(const Executable: string);
@@ -121,7 +122,7 @@ begin
   begin
     {$I-}BlockWrite(f, aContent[1], Length(aContent));{$I+}
     if ioresult<>0 then
-      dolog(llError, aFilename+': Could not write to disk!');
+      dolog(llError, [aFilename, ': Could not write to disk!']);
     Closefile(f);
   end;
 end;
@@ -162,7 +163,7 @@ end;
 
 procedure TWebserverSite.log(Level: TLoglevel; Msg: string);
 begin
-  dolog(Level, '['+FName+'] '+Msg);
+  dolog(Level, ['[', FName, '] ', Msg]);
 end;
 
 function IntToFilesize(Size: longword): string;
@@ -284,6 +285,11 @@ procedure TWebserverSite.AddCustomHandler(url: string;
   Handler: TEpollWorkerThread);
 begin
   FCustomHandlers.Add(ansistring(url), Handler);
+end;
+
+procedure TWebserverSite.RemoveCustomHandler(url: string);
+begin
+  FCUstomHandlers.Delete(url);
 end;
 
 procedure TWebserverSite.AddCustomStatusPage(StatusCode: Word; URI: string);
@@ -432,7 +438,7 @@ begin
   i:=Length(FHosts);
   Setlength(FHosts, i+1);
   FHosts[i]:=result;
-  dolog(llNotice, 'Loaded site "'+Path+'"');
+  dolog(llNotice, ['Loaded site "', Path, '"']);
   // result.AddHostAlias(Hostname);
 end;
 

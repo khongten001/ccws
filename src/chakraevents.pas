@@ -9,10 +9,12 @@ uses
   SysUtils,
   SyncObjs,
   contnrs,
-  chakrainstance,
   ChakraCommon,
   ChakraCore,
-  ChakraRTTIObject;
+  ChakraCoreClasses,
+  ChakraCoreUtils,
+  chakrainstance,
+  ChakraEventObject;
 
 
 const
@@ -22,23 +24,25 @@ type
   TEventListManager = class;
 
   TEventItem = record
-    Name, Data: widestring;
+    Name, Data: string;
   end;
 
   { TEventList }
 
   TEventList = class
   private
-    FName: widestring;
+    FName: string;
     FRefCount: Integer;
     FEventReadPos, FEventWritePos: Longword;
     FEvents: array[0..EventBufferSize-1] of TEventItem;
   public
-    constructor Create(Name: widestring);
-    procedure AddEvent(const Name, Data: widestring);
-    function GetEvent(var Position: Longword; var Name, Data: widestring): Boolean;
+    constructor Create(Name: string);
+    destructor Destroy; override;
+    procedure AddEvent(const Name, Data: string);
+    function GetEvent(var Position: Longword; var Name, Data: string): Boolean;
     function GetListenerPosition: Longword;
-    property Name: widestring read FName;
+    property Name: string read FName;
+    property RefCount: Integer read FRefCount write FRefCount;
   end;
 
   { TEventListManager }
@@ -46,28 +50,12 @@ type
   TEventListManager = class
   private
     FCS: TCriticalSection;
-    FLists: TFPDataHashTable;
+    FLists: TFPObjectHashTable;
   public
     constructor Create;
     destructor Destroy; override;
-    function GetEventList(Name: widestring): TEventList;
+    function GetEventList(Name: string): TEventList;
     procedure ReleaseEventList(List: TEventList);
-  end;
-
-  TChakraEventListener = class;
-
-  { TChakraEventEntries }
-
-  TChakraEventEntries = class
-  private
-    FParent: TChakraEventListener;
-    FInstance: TChakraInstance;
-    //FEntries: array of TBESENObjectFunction;
-  public
-    constructor Create(Parent: TChakraEventListener; Instance: TChakraInstance);
-    destructor Destroy; override;
-    //procedure Add(Func: TBESENObjectFunction);
-    procedure Fire(const Data: UnicodeString);
   end;
 
   { TChakraEventListener }
@@ -76,25 +64,19 @@ type
 
     Example:
     var foo = new EventList("bar"); }
-  TChakraEventListener = class(TNativeRTTIObject)
+  TChakraEventListener = class(TNativeRTTIEventObject)
   private
     FEvents: TEventList;
-    FListeners: TFPDataHashTable;
     FPosition: Longword;
+    FDebug: string;
+    FChakraInstance: TChakraInstance;
   protected
     procedure ProcessEvents;
-    //procedure ConstructObject(const ThisArgument:TBESENValue;Arguments:PPBESENValues;CountArguments:integer); override;
-    //procedure InitializeObject; override;
-    //procedure FinalizeObject; override;
-    Procedure ClearItems(Item: Pointer; const Key: ansistring; var Continue: Boolean);
   public
+    constructor Create(Args: PJsValueRef = nil; ArgCount: Word = 0; AFinalize: Boolean = False); override;
     destructor Destroy; override;
   published
-    { addEventListener(eventName, callback) - adds a listener entry. callback = function(data) }
-    //procedure addEventListener(const ThisArgument:TBESENValue;Arguments:PPBESENValues;CountArguments:integer;var ResultValue:TBESENValue);
-    { fireEvent(eventName, data) - fires an event. "data" must be of type string, as the
-      event will be fired accross multiple script instances }
-    //procedure fireEvent(const ThisArgument:TBESENValue;Arguments:PPBESENValues;CountArguments:integer;var ResultValue:TBESENValue);
+    function globalDispatch(Arguments: PJsValueRefArray; CountArguments: word): JsValueRef;
   end;
 
 var
@@ -111,7 +93,7 @@ uses
 constructor TEventListManager.Create;
 begin
   FCS:=TCriticalSection.Create;
-  FLists:=TFPDataHashTable.Create;
+  FLists:=TFPObjectHashTable.Create(True);
 end;
 
 destructor TEventListManager.Destroy;
@@ -121,228 +103,99 @@ begin
   inherited Destroy;
 end;
 
-function TEventListManager.GetEventList(Name: widestring): TEventList;
+function TEventListManager.GetEventList(Name: string): TEventList;
 begin
   result:=nil;
-  (*
   FCS.Enter;
   try
-    n:=BESENUTF16ToUTF8(Name);
-    result:=FLists[n];
+    result:=TEventList(FLists[Name]);
     if not Assigned(result) then
     begin
       result:=TEventList.Create(Name);
-      FLists[n]:=result;
+      FLists[Name]:=result;
     end;
     Inc(result.FRefCount);
   finally
     FCS.Leave;
-  end; *)
+  end;
 end;
 
 procedure TEventListManager.ReleaseEventList(List: TEventList);
 begin
-  (*
   FCS.Enter;
   try
     Dec(List.FRefCount);
     if List.FRefCount<=0 then
     begin
-      FLists.Delete(BESENUTF16ToUTF8(List.Name));
-      List.Free;
+      FLists.Delete(List.Name);
     end;
   finally
     FCS.Leave;
-  end; *)
+  end;
 end;
 
 { TChakraEventListener }
 
-(*
-procedure TChakraEventListener.ConstructObject(const ThisArgument: TBESENValue;
-  Arguments: PPBESENValues; CountArguments: integer);
-begin
-  if CountArguments<1 then
-    raise EBESENError.Create('Identifier expected');
-
-  TBESENInstance(Instance).AddEventHandler(ProcessEvents);
-
-  if not Assigned(FEvents) then
-  begin
-    FEvents:=EventListManager.GetEventList(TBESEN(Instance).ToStr(Arguments^[0]^));
-    FPosition:=FEvents.GetListenerPosition;
-  end;
-end;
-
-procedure TChakraEventListener.InitializeObject;
-begin
-  if not Assigned(FListeners) then
-    FListeners:=TFPDataHashTable.Create;
-  inherited InitializeObject;
-end;
-
-procedure TChakraEventListener.FinalizeObject;
-begin
-  if Assigned(FEvents) then
-  begin
-    //if Assigned(TBESEN(Instance).Tag) then
-    TBESENInstance(Instance).RemoveEventHandler(ProcessEvents);
-
-    EventListManager.ReleaseEventList(FEvents);
-    FEvents:=nil;
-  end;
-  if Assigned(FListeners) then
-  begin
-    FListeners.Iterate(ClearItems);
-    FListeners.Free;
-    FListeners:=nil;
-  end;
-  inherited FinalizeObject;
-end;     *)
-
-procedure TChakraEventListener.ClearItems(Item: Pointer; const Key: ansistring;
-  var Continue: Boolean);
-begin
-  Continue:=True;
-  if Assigned(Item) then
-  begin
-    if TObject(Item) is TChakraEventEntries then
-    begin
-      TChakraEventEntries(Item).Free;
-    end;
-  end;
-end;
-
 destructor TChakraEventListener.Destroy;
 begin
+  if Assigned(FChakraInstance) then
+  begin
+    FChakraInstance.RemoveEventHandler(@ProcessEvents);
+  end;
+  if Assigned(FEvents) then
+    EventListManager.ReleaseEventList(FEvents);
   inherited Destroy;
+end;
+
+function TChakraEventListener.globalDispatch(Arguments: PJsValueRefArray;
+  CountArguments: word): JsValueRef;
+begin
+  result:=JsUndefinedValue;
+  if CountArguments < 2 then
+    raise Exception.Create('Argument expected');
+  if Assigned(FEvents) then
+    FEvents.AddEvent(
+      JsStringToUTF8String(JsValueAsJsString(Arguments^[0])),
+      JsStringToUTF8String(JsValueAsJsString(Arguments^[1]))
+    );
 end;
 
 procedure TChakraEventListener.ProcessEvents;
 var
-  Name, Data: widestring;
-  p: TChakraEventEntries;
+  Name: string;
+  Data: string;
+  ev: TChakraEvent;
 begin
+  Name:='';
+  Data:='';
   if Assigned(FEvents) then
   while FEvents.GetEvent(FPosition, Name, Data) do
   begin
-    p:=TChakraEventEntries(FListeners[ansistring(Name)]);
-    if Assigned(p) then
-      p.Fire(Data);
+    ev:=TChakraEvent.Create(Name, False);
+    JsSetProperty(ev.Instance, 'data', StringToJsString(Data));
+    dispatchEvent(ev);
+    ev.Free;
   end;
 end;
 
-(*
-procedure TChakraEventListener.addEventListener(const ThisArgument: TBESENValue;
-  Arguments: PPBESENValues; CountArguments: integer;
-  var ResultValue: TBESENValue);
-var
-  Name: ansistring;
-  o: TBESENObject;
-  p: TChakraEventEntries;
+constructor TChakraEventListener.Create(Args: PJsValueRef; ArgCount: Word;
+  AFinalize: Boolean);
 begin
-  ResultValue:=BESENUndefinedValue;
+  if ArgCount<1 then
+    raise Exception.Create('Argument expected');
+  if ArgCount>1 then
+    FDebug:=JsStringToUTF8String(JsValueAsJsString(Args[1]));
 
-  if CountArguments<2 then
-    Exit;
-
-  Name:=ansistring(TBESEN(Instance).ToStr(Arguments^[0]^));
-  o:=TBESEN(Instance).ToObj(Arguments^[1]^);
-
-  if not (o is TBESENObjectFunction) then
-    raise EBESENError.Create('Function expected');
-
-  p:=TChakraEventEntries(FListeners[Name]);
-  if not Assigned(p) then
-  begin
-    p:=TChakraEventEntries.Create(Self, TBESEN(Instance));
-    FListeners[Name]:=p;
-  end;
-  p.Add(TBESENObjectFunction(o));
-  ResultValue:=BESENBooleanValue(True);
-end;
-
-procedure TChakraEventListener.fireEvent(const ThisArgument: TBESENValue;
-  Arguments: PPBESENValues; CountArguments: integer;
-  var ResultValue: TBESENValue);
-var
-  Name, Data: TBESENString;
-begin
-  ResultValue:=BESENUndefinedValue;
-
-  if CountArguments<2 then
-    Exit;
-
-  Name:=TBESEN(Instance).ToStr(Arguments^[0]^);
-
-  if Arguments^[1]^.ValueType = bvtOBJECT then
-  begin
-    Data:=TBESEN(Instance).ToStr(TBESEN(Instance).JSONStringify(Arguments^[1]^));
-  end else
-    Data:=TBESEN(Instance).ToStr(Arguments^[1]^);
-
-  if Assigned(FEvents) then
-    FEvents.AddEvent(Name, Data);
-
-  ResultValue:=BESENBooleanValue(True);
-end;          *)
-
-{ TChakraEventEntries }
-
-constructor TChakraEventEntries.Create(Parent: TChakraEventListener;
-  Instance: TChakraInstance);
-begin
-  FParent:=Parent;
-  FInstance:=Instance;
-  // Setlength(FEntries, 0);
-end;
-
-destructor TChakraEventEntries.Destroy;
-begin
-  (*
-  if not TBESENInstance(FInstance).ShuttingDown then
-  for i:=0 to Length(FEntries)-1 do
-  begin
-    FInstance.GarbageCollector.Unprotect(FEntries[i]);
-  end;
-  Setlength(FEntries, 0); *)
-  inherited Destroy;
-end;
-
-(*
-procedure TChakraEventEntries.Add(Func: TBESENObjectFunction);
-var
-  i: Integer;
-begin
-  FInstance.GarbageCollector.Protect(Func);
-  i:=Length(FEntries);
-  Setlength(FEntries, i+1);
-  FEntries[i]:=Func;
-end;   *)
-
-procedure TChakraEventEntries.Fire(const Data: UnicodeString);
-begin (*
-var
-  i: Integer;
-  val: TBESENValue;
-  pval: PBESENValue;
-  Result: TBESENValue;
-begin
-  pval:=@val;
-  val:=BESENStringValue(Data);
-
-  for i:=0 to Length(FEntries)-1 do
-  try
-    FEntries[i].Call(BESENObjectValue(FParent), @pval, 1, Result);
-  except
-    on e: Exception do
-      TBESENInstance(FInstance).OutputException(e, 'Event');
-  end;  *)
+  inherited Create(Args, ArgCount, AFinalize);
+  FChakraInstance:=(Context.Runtime as TChakraInstance);
+  FChakraInstance.AddEventHandler(@ProcessEvents);
+  FEvents:=EventListManager.GetEventList(JsStringToUTF8String(JsValueAsJsString(@Args^[0])));
+  FPosition:=FEvents.GetListenerPosition;
 end;
 
 { TEventList }
 
-constructor TEventList.Create(Name: widestring);
+constructor TEventList.Create(Name: string);
 begin
   FName:=name;
   FRefCount:=0;
@@ -350,17 +203,29 @@ begin
   FEventWritePos:=0;
 end;
 
-procedure TEventList.AddEvent(const Name, Data: widestring);
+destructor TEventList.Destroy;
+var
+  i: Integer;
+begin
+  for i:=0 to Length(FEvents)-1 do
+  begin
+    FEvents[i].Name:='';
+    FEvents[i].Data:='';
+  end;
+  inherited Destroy;
+end;
+
+procedure TEventList.AddEvent(const Name, Data: string);
 var
   pos: Longword;
 begin
-  pos:=InterLockedIncrement(FEventWritePos) mod EventBufferSize;
-  FEvents[pos-1].Name:=Name;
-  FEvents[pos-1].Data:=Data;
+  pos:=InterLockedIncrement(FEventWritePos);
+  FEvents[(pos-1) mod EventBufferSize].Name:=Name;
+  FEvents[(pos-1) mod EventBufferSize].Data:=Data;
   InterlockedIncrement(FEventReadPos);
 end;
 
-function TEventList.GetEvent(var Position: Longword; var Name, Data: widestring
+function TEventList.GetEvent(var Position: Longword; var Name, Data: string
   ): Boolean;
 var
   l: Longword;

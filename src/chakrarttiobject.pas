@@ -6,6 +6,7 @@ unit ChakraRTTIObject;
 {$M+}
 
 {$define LowercaseFirstLetter}
+{.$define DebugUsage}
 
 interface
 
@@ -19,26 +20,45 @@ uses
   ChakraCoreUtils;
 
 type
+  TRTTIMethodCallback = procedure(AInstance: JsValueRef; name: string; Addr: Pointer) of object;
+
   { TNativeRTTIObject }
   TNativeRTTIObject = class(TNativeObject)
   private
     FThrowOnEnum: Boolean;
     FThrowOnRead: Boolean;
     FThrowOnWrite: Boolean;
+    class procedure RegisterRTTIMethod(AInstance: JsValueRef; name: string; Addr: Pointer);
+    class procedure UnregisterRTTIMethod(AInstance: JsValueRef; name: string; Addr: Pointer);
+    class procedure EnumerateRTTIMethods(AInstance: JsValueRef; Callback: TRTTIMethodCallback);
   protected
+    class function InitializePrototype(AConstructor: JsValueRef): JsValueRef; override;
     class procedure RegisterRttiProperty(AInstance: JsValueRef; PropInfo: PPropInfo);
+    class procedure UnregisterRttiProperty(AInstance: JsValueRef; PropInfo: PPropInfo);
     class procedure RegisterProperties(AInstance: JsValueRef); override;
     class procedure RegisterMethods(AInstance: JsValueRef); override;
+    procedure UnregisterProperties;
   public
     constructor Create(Args: PJsValueRef = nil; ArgCount: Word = 0; AFinalize: Boolean = False); override;
+    destructor Destroy; override;
     property ThrowOnInvalidEnum: Boolean read FThrowOnEnum write FThrowOnEnum;
     property ThrowOnInvalidRead: Boolean read FThrowOnRead write FThrowOnRead;
     property ThrowOnInvalidWrite: Boolean read FThrowOnWrite write FThrowOnWrite;
   end;
 
+
+{$ifdef DebugUsage}
+procedure ChakraRTTIObjectDebugDump;
+{$endif DebugUsage}
+
 implementation
 
 uses
+  {$ifdef DebugUsage}
+  syncobjs,
+  contnrs,
+  logging,
+  {$endif DebugUsage}
   rttiutils;
 
 type
@@ -102,6 +122,30 @@ type
     {$endif}
     Methods: TMethodNameRecs;
   end;
+
+{$ifdef DebugUsage}
+var
+  DebugCS: TCriticalSection;
+  DebugInfo: TFPDataHashTable;
+
+procedure IterateDebugInfoProc(Item: Pointer; const Key: string; var Continue: Boolean);
+begin
+  doLog(llDebug, Key + ': ' + IntToStr({%H-}PtrUint(Item)));
+end;
+
+procedure ChakraRTTIObjectDebugDump;
+begin
+  DebugCS.Enter;
+  try
+    doLog(llDebug, 'RTTI Object Dump:');
+    DebugInfo.Iterate(@IterateDebugInfoProc);
+    doLog(llDebug, '---');
+  finally
+    DebugCS.Leave;
+  end;
+end;
+
+{$endif}
 
 function GetIntValue(Target: Pointer; OrdType: TOrdType): Int64;
 begin
@@ -234,6 +278,7 @@ begin
           Value := PInt64(@base^[offset])^;
           Result := DoubleToJsNumber(Value);
         end;
+        tkAString,
         tkString:
         begin
           Result := StringToJsString(PAnsistring(@base^[Offset])^);
@@ -319,6 +364,7 @@ begin
           Value := TRTTIGetInt64Proc(Method)();
           Result := DoubleToJsNumber(Value);
         end;
+        TkAString,
         tkString:
         begin
           Result := StringToJSString(TRTTIGetAnsiStringProc(Method)());
@@ -426,6 +472,7 @@ begin
         begin
           PInt64(@base^[offset])^ := Round(val);
         end;
+        tkAString,
         tkString:
         begin
           PAnsiString(@base^[Offset])^ := ansistring(JsStringToUnicodeString(Args^[1]));
@@ -485,6 +532,7 @@ begin
         begin
           TRTTISetInt64Proc(Method)(Round(val));
         end;
+        tkAString,
         tkString:
         begin
           TRTTISetAnsistringProc(Method)(
@@ -527,6 +575,61 @@ end;
 
 { TNativeRTTIObject }
 
+class procedure TNativeRTTIObject.RegisterRTTIMethod(AInstance: JsValueRef;
+  name: string; Addr: Pointer);
+begin
+  {$IFDEF LowercaseFirstLetter}
+  if Length(Name)>0 then
+    Name[1]:=LowerCase(Name[1]);
+  {$ENDIF}
+  RegisterMethod(AInstance, UTF8Decode(Name), Addr);
+end;
+
+function NullProc(callee: JsValueRef; isConstructCall: bool; arguments: PJsValueRef; argumentCount: Word;
+    callbackState: Pointer): JsValueRef; {$ifdef WINDOWS}stdcall;{$else}cdecl;{$endif}
+begin
+  result:=JsUndefinedValue;
+end;
+
+class procedure TNativeRTTIObject.UnregisterRTTIMethod(AInstance: JsValueRef;
+  name: string; Addr: Pointer);
+begin
+  //JsSetCallback(Instance: JsValueRef; const CallbackName: UnicodeString; Callback: JsNativeFunction;
+  //  CallbackState: Pointer; UseStrictRules: Boolean = True): JsValueRef; overload;
+  JsSetCallback(AInstance, name, @NullProc, nil);
+end;
+
+class procedure TNativeRTTIObject.EnumerateRTTIMethods(AInstance: JsValueRef;
+  Callback: TRTTIMethodCallback);
+var
+  ClassRef: Pointer;
+  MethodTable: PMethodNameTable;
+  i: integer;
+begin
+  ClassRef:=Pointer(Self);
+  while Assigned(ClassRef) do
+  begin
+    MethodTable := pointer({%H-}pointer({%H-}ptruint({%H-}ClassRef) + vmtMethodTable)^);
+    if assigned(MethodTable) then
+    begin
+      for i := 0 to MethodTable^.Count - 1 do
+      begin
+        Callback(AInstance, MethodTable^.Methods[i].Name^, MethodTable^.Methods[i].Address);
+      end;
+    end;
+    ClassRef:=pointer({%H-}pointer({%H-}ptruint({%H-}ClassRef) + vmtParent)^);
+  end;
+end;
+
+class function TNativeRTTIObject.InitializePrototype(AConstructor: JsValueRef
+  ): JsValueRef;
+begin
+  if Self.ClassParent = TNativeRTTIObject then
+    Result := JsGetProperty(AConstructor, 'prototype')
+  else
+    Result := inherited InitializePrototype(AConstructor);
+end;
+
 class procedure TNativeRTTIObject.RegisterRttiProperty(AInstance: JsValueRef;
   PropInfo: PPropInfo);
 var
@@ -543,9 +646,33 @@ begin
   JsSetCallback(Descriptor, 'set', JSNativeFunction(@Native_PropSetCallback),
     PropInfo, True);
   PropName := UTF8Encode(PropInfo^.Name);
+  if Pos('_', PropName) = 1 then
+    Delete(PropName, 1, 1);
   {$IFDEF LowercaseFirstLetter}
   if Length(PropName)>0 then
-    PropName[1]:=UpCase(PropName[1]);
+    PropName[1]:=LowerCase(PropName[1]);
+  {$ENDIF}
+  ChakraCoreCheck(JsCreatePropertyId(PAnsiChar(PropName), Length(PropName), PropId));
+  ChakraCoreCheck(JsDefineProperty(AInstance, PropId, Descriptor, B));
+end;
+
+class procedure TNativeRTTIObject.UnregisterRttiProperty(AInstance: JsValueRef;
+  PropInfo: PPropInfo);
+var
+  Descriptor: JsValueRef;
+  PropName: UTF8String;
+  PropId: JsPropertyIdRef;
+  B: bytebool;
+begin
+  Descriptor := JsCreateObject;
+  JsSetProperty(Descriptor, 'configurable', JsFalseValue, True);
+  JsSetProperty(Descriptor, 'enumerable', JsTrueValue, True);
+  PropName := UTF8Encode(PropInfo^.Name);
+  if Pos('_', PropName) = 1 then
+    Delete(PropName, 1, 1);
+  {$IFDEF LowercaseFirstLetter}
+  if Length(PropName)>0 then
+    PropName[1]:=LowerCase(PropName[1]);
   {$ENDIF}
   ChakraCoreCheck(JsCreatePropertyId(PAnsiChar(PropName), Length(PropName), PropId));
   ChakraCoreCheck(JsDefineProperty(AInstance, PropId, Descriptor, B));
@@ -568,7 +695,7 @@ begin
     for i := 0 to TypeData^.PropCount - 1 do
     begin
       if PropList^[i]^.PropType^.Kind in [tkFloat, tkInteger, tkInt64,
-        tkString, tkWString, tkUString, tkEnumeration] then
+        tkAString, tkWString, tkUString, tkEnumeration] then
       begin
         RegisterRttiProperty(AInstance, PropList^[i]);
       end
@@ -586,27 +713,43 @@ begin
 end;
 
 class procedure TNativeRTTIObject.RegisterMethods(AInstance: JsValueRef);
-var
-  MethodTable: PMethodNameTable;
-  i: integer;
-  Name: UnicodeString;
 begin
   inherited RegisterMethods(AInstance);
-  MethodTable := pointer({%H-}pointer(ptruint({%H-}ptruint(pointer(self)) +
-    vmtMethodTable))^);
-  if assigned(MethodTable) then
-  begin
-    for i := 0 to MethodTable^.Count - 1 do
+  EnumerateRTTIMethods(AInstance, RegisterRTTIMethod);
+end;
+
+procedure TNativeRTTIObject.UnregisterProperties;
+var
+  i: integer;
+  TypeData: PTypeData;
+  PropList: PPropList;
+begin
+  TypeData := GetTypeData(Self.ClassInfo);
+  Self.ClassInfo;
+  if not Assigned(TypeData) then
+    Exit;
+  GetMem(PropList, TypeData^.PropCount * SizeOf(Pointer));
+  try
+    GetPropInfos(Self.ClassInfo, PropList);
+    for i := 0 to TypeData^.PropCount - 1 do
     begin
-      // TODO wantfix: test if method signature is correct
-      Name:=UnicodeString(MethodTable^.Methods[i].Name^);
-      {$IFDEF LowercaseFirstLetter}
-      if Length(Name)>0 then
-        Name[1]:=LowerCase(Name[1]);
-      {$ENDIF}
-      RegisterMethod(AInstance, Name,
-        MethodTable^.Methods[i].Address);
+      if PropList^[i]^.PropType^.Kind in [tkFloat, tkInteger, tkInt64,
+        tkAString, tkWString, tkUString, tkEnumeration] then
+      begin
+        UnregisterRttiProperty(Instance, PropList^[i]);
+      end
+      else
+      if PropList^[i]^.PropType^.Kind = tkClass then
+      begin
+        if GetTypeData(PropList^[i]^.PropType)^.ClassType.InheritsFrom(
+          TNativeObject) then
+        begin
+          UnregisterRttiProperty(Instance, PropList^[i]);
+        end;
+      end;
     end;
+  finally
+    FreeMem(PropList);
   end;
 end;
 
@@ -614,9 +757,44 @@ constructor TNativeRTTIObject.Create(Args: PJsValueRef; ArgCount: Word;
   AFinalize: Boolean);
 begin
   inherited Create(Args, ArgCount, AFinalize);
+  {$ifdef DebugUsage}
+  DebugCS.Enter;
+  try
+    DebugInfo[ClassName]:={%H-}Pointer({%H-}PtrUInt(DebugInfo[ClassName]) + 1);
+  finally
+    DebugCS.Leave;
+  end;
+  {$endif DebugUsage}
   FThrowOnEnum:=True;
   FThrowOnRead:=True;
   FThrowOnWrite:=True;
 end;
 
+destructor TNativeRTTIObject.Destroy;
+begin
+  {$ifdef DebugUsage}
+  DebugCS.Enter;
+  try
+    DebugInfo[ClassName]:={%H-}Pointer({%H-}PtrUInt(DebugInfo[ClassName]) - 1);
+  finally
+    DebugCS.Leave;
+  end;
+  {$endif DebugUsage}
+  try
+    EnumerateRTTIMethods(Instance, UnregisterRTTIMethod);
+    UnregisterProperties;
+  except
+    // swallow exceptions that happen when the whole instance is destroyed..
+  end;
+  inherited Destroy;
+end;
+
+{$ifdef DebugUsage}
+initialization
+  DebugCS:=TCriticalSection.Create;
+  DebugInfo:=TFPDataHashTable.Create;
+finalization
+  DebugCS.Free;
+  DebugInfo.Free;
+{$endif DebugUsage}
 end.

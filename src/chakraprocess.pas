@@ -10,7 +10,10 @@ uses
   Linux,
   ChakraCommon,
   ChakraCore,
+  ChakraCoreClasses,
+  ChakraCoreUtils,
   ChakraRTTIObject,
+  ChakraEventObject,
   chakrainstance,
   webserverhosts,
   epollsockets,
@@ -18,6 +21,17 @@ uses
 
 type
   TChakraProcess = class;
+
+  { TChakraProcessEvent }
+
+  TChakraProcessEvent = class(TChakraEvent)
+  private
+    FData: string;
+    FExitCode: Integer;
+  published
+    property data: string read FData write FData;
+    property exitCode: Integer read FExitCode write FExitCode;
+  end;
 
   { TChakraProcessDataHandler }
 
@@ -33,33 +47,32 @@ type
     destructor Destroy; override;
   end;
 
-  { TBESENProcess }
+  { TChakraProcess }
 
-  TChakraProcess = class(TNativeRTTIObject)
+  TChakraProcess = class(TNativeRTTIEventObject)
   private
     FHasTerminated: Boolean;
-    //FOnData: TBESENObjectFunction;
-    //FOnTerminate: TBESENObjectFunction;
-    //FParentThread: TEpollWorkerThread;
-    //FParentSite: TWebserverSite;
+    FParentThread: TEpollWorkerThread;
+    FParentSite: TWebserverSite;
     FProcess: TProcess;
     FDataHandler: TChakraProcessDataHandler;
+    function GetExitCode: Integer;
+    function GetTerminated: Boolean;
   protected
     //procedure ConstructObject(const ThisArgument:TBESENValue;Arguments:PPBESENValues;CountArguments:integer); override;
     //procedure FinalizeObject; override;
     procedure StopProcess;
   public
+    constructor Create(Args: PJsValueRef = nil; ArgCount: Word = 0; AFinalize: Boolean = False); override;
     destructor Destroy; override;
   published
-    (*
-    procedure start(const ThisArgument:TBESENValue;Arguments:PPBESENValues;CountArguments:integer;var ResultValue:TBESENValue);
-    procedure stop(const ThisArgument:TBESENValue;Arguments:PPBESENValues;CountArguments:integer;var ResultValue:TBESENValue);
-    procedure addEnvironment(const ThisArgument:TBESENValue;Arguments:PPBESENValues;CountArguments:integer;var ResultValue:TBESENValue);
-    procedure write(const ThisArgument:TBESENValue;Arguments:PPBESENValues;CountArguments:integer;var ResultValue:TBESENValue);
-    procedure writeln(const ThisArgument:TBESENValue;Arguments:PPBESENValues;CountArguments:integer;var ResultValue:TBESENValue);
-    procedure isTerminated(const ThisArgument:TBESENValue;Arguments:PPBESENValues;CountArguments:integer;var ResultValue:TBESENValue);
-    property onData: TBESENObjectFunction read FOnData write FOnData;
-    property onTerminate: TBESENObjectFunction read FOnTerminate write FOnTerminate; *)
+    function start(Arguments: PJsValueRefArray; CountArguments: word): JsValueRef;
+    function stop(Arguments: PJsValueRefArray; CountArguments: word): JsValueRef;
+    function setEnvironment(Arguments: PJsValueRefArray; CountArguments: word): JsValueRef;
+    function write(Arguments: PJsValueRefArray; CountArguments: word): JsValueRef;
+    function writeLine(Arguments: PJsValueRefArray; CountArguments: word): JsValueRef;
+    function isTerminated(Arguments: PJsValueRefArray; CountArguments: word): JsValueRef;
+    property exitCode: Integer read GetExitCode;
   end;
 
 implementation
@@ -68,34 +81,24 @@ uses
   baseunix,
   unix,
   chakrawebsocket,
-  termio,
   logging;
 
 { TChakraProcessDataHandler }
 
 procedure TChakraProcessDataHandler.DataReady(Event: epoll_event);
-//var
-//  buf: ansistring;
-//  AResult, AArg: TBESENValue;
-//  Arg: PBESENValue;
-
+var
+  buf: string;
+  e: TChakraProcessEvent;
 begin
   if (Event.Events and EPOLLIN<>0) then
   begin
-    (*
     setlength(buf, FTarget.FProcess.Output.NumBytesAvailable);
     FTarget.FProcess.Output.Read(buf[1], Length(buf));
-    if Assigned(FTarget.onData) then
-    begin
-      Aarg:=BESENStringValue(TBESENString(buf));
-      Arg:=@Aarg;
-      try
-        FTarget.onData.Call(BESENObjectValue(FTarget), @Arg, 1, AResult);
-      except
-        on e: Exception do
-          TBESENInstance(FTarget.Instance).OutputException(e, 'Process.onData');
-      end;
-    end; *)
+    e:=TChakraProcessEvent.Create('data');
+    e.data:=buf;
+    e.exitCode:=0;
+    FTarget.dispatchEvent(e);
+    e.Free;
   end else
   begin
     FTarget.StopProcess;
@@ -186,31 +189,95 @@ begin
     FreeAndNil(FProcess);
 end;   *)
 
+function TChakraProcess.GetTerminated: Boolean;
+begin
+  if Assigned(FProcess) then
+    result:=not FProcess.Running
+  else
+    result:=True;
+end;
+
+function TChakraProcess.GetExitCode: Integer;
+begin
+  if Assigned(FProcess) then
+    result:=FProcess.ExitCode
+  else
+    result:=-1;
+end;
+
 procedure TChakraProcess.StopProcess;
-//var
-//  AResult: TBESENValue;
+var
+  e: TChakraProcessEvent;
 begin
   if Assigned(FProcess) then
   begin
     if Assigned(FDataHandler) then
-      FreeandNil(FDataHandler);
+    begin
+      FDataHandler.DelayedFree;
+      FDataHandler:=nil;
+    end;
 
     if FHasTerminated then
       Exit;
 
-    dolog(llDebug, 'Terminating process '+string(FProcess.Executable));
+    dolog(llDebug, ['Terminating process ', FProcess.Executable]);
     FProcess.Terminate(0);
     FHasTerminated:=True;
 
-    (*
-    if Assigned(FOnTerminate) then
-    try
-      FOnTerminate.Call(BESENObjectValue(Self), nil, 0, AResult);
-    except
-      on e: Exception do
-        TBESENInstance(Instance).OutputException(e, 'Process.onTerminate');
-    end; *)
+    e:=TChakraProcessEvent.Create('terminate');
+    e.data:='';
+    e.exitCode:=FProcess.ExitCode;
+    dispatchEvent(e);
+    e.Free;
   end;
+end;
+
+constructor TChakraProcess.Create(Args: PJsValueRef; ArgCount: Word;
+  AFinalize: Boolean);
+var
+  i: Integer;
+  s: ansistring;
+  ci: TChakraInstance;
+begin
+  inherited Create(Args, ArgCount, AFinalize);
+  if ArgCount<1 then
+    raise Exception.Create('Argument expected in constructor');
+
+  FParentThread:=nil;
+  FParentSite:=nil;
+
+  FHasTerminated:=True;
+
+  if Context.Runtime is TChakraInstance then
+  begin
+    ci:=TChakraInstance(Context.Runtime);
+    if Assigned(ci.Thread) and
+       (ci.Thread is TEpollWorkerThread) then
+    begin
+      FParentThread:=TEpollWorkerThread(ci.Thread);
+      if FParentThread is TChakraWebsocket then
+        FParentSite:=TChakraWebsocket(FParentThread).Site;
+    end;
+  end;
+
+  s:=JsStringToUTF8String(JsValueAsJsString(Args[0]));
+
+  if Assigned(FParentSite) then
+  begin
+    if(pos('/', s)<>1) then
+      s:=FParentSite.Path+'bin/'+s;
+
+    if not FParentSite.IsProcessWhitelisted(s) then
+      raise Exception.Create('Target executable is not whitelisted');
+
+  end;
+
+  FProcess:=TProcess.Create(nil);
+  FProcess.Executable:=s;
+  FProcess.Options:=[poStderrToOutPut];
+  FProcess.CurrentDirectory:=ExtractFilePath(s);
+  for i:=1 to ArgCount-1 do
+    FProcess.Parameters.Add(JsStringToUTF8String(JsValueAsJsString(Args[i])));
 end;
 
 destructor TChakraProcess.Destroy;
@@ -219,20 +286,20 @@ begin
   if Assigned(FProcess) then
     FreeAndNil(FProcess);
 end;
-(*
-procedure TChakraProcess.start(const ThisArgument: TBESENValue;
-  Arguments: PPBESENValues; CountArguments: integer;
-  var ResultValue: TBESENValue);
+
+function TChakraProcess.start(Arguments: PJsValueRefArray; CountArguments: word
+  ): JsValueRef;
 begin
+  result:=JsUndefinedValue;
   if Assigned(FProcess) then
   begin
     if FProcess.Running then
       Exit;
 
-    dolog(llDebug, 'Starting process '+FProcess.Executable);
+    dolog(llDebug, ['Starting process ', FProcess.Executable]);
     if Assigned(FParentThread) then
     begin
-      FDataHandler:=TBESENProcessDataHandler.Create(Self, FParentThread);
+      FDataHandler:=TChakraProcessDataHandler.Create(Self, FParentThread);
       FProcess.Options:=[poUsePipes, poStderrToOutPut];
     end;
 
@@ -246,73 +313,69 @@ begin
   end;
 end;
 
-procedure TChakraProcess.stop(const ThisArgument: TBESENValue;
-  Arguments: PPBESENValues; CountArguments: integer;
-  var ResultValue: TBESENValue);
+function TChakraProcess.stop(Arguments: PJsValueRefArray; CountArguments: word
+  ): JsValueRef;
 begin
+  result:=JsUndefinedValue;
   StopProcess;
 end;
 
-procedure TChakraProcess.addEnvironment(const ThisArgument: TBESENValue;
-  Arguments: PPBESENValues; CountArguments: integer;
-  var ResultValue: TBESENValue);
+function TChakraProcess.setEnvironment(Arguments: PJsValueRefArray;
+  CountArguments: word): JsValueRef;
 var
   i: Integer;
 begin
+  result:=JsUndefinedValue;
   if Assigned(FProcess) then
     for i:=0 to CountArguments-1 do
-      FProcess.Environment.Add(ansistring(TBESEN(Instance).ToStr(Arguments^[i]^)));
+      FProcess.Environment.Add(JsStringToUTF8String(JsValueAsJsString(Arguments^[i])));
 end;
 
-procedure TChakraProcess.write(const ThisArgument: TBESENValue;
-  Arguments: PPBESENValues; CountArguments: integer;
-  var ResultValue: TBESENValue);
+function TChakraProcess.write(Arguments: PJsValueRefArray; CountArguments: word
+  ): JsValueRef;
 var
   i: Integer;
   s: ansistring;
 begin
-  if (not Assigned(FProcess)) or (not Assigned(FDataHandler))or(CountArguments=0) then
+  result:=JsUndefinedValue;
+  if (not Assigned(FProcess)) or (not Assigned(FDataHandler)) or (CountArguments=0) then
     Exit;
 
   s:='';
   for i:=0 to CountArguments-1 do
   begin
     if i>0 then s:=s+' ';
-    s:=s + ansistring(TBESEN(Instance).ToStr(Arguments^[i]^));
+    s:=s + JsStringToUTF8String(JsValueAsJsString(Arguments^[i]));
   end;
   if s<>'' then
     FProcess.Input.WriteBuffer(s[1], Length(s));
 end;
 
-procedure TChakraProcess.writeln(const ThisArgument: TBESENValue;
-  Arguments: PPBESENValues; CountArguments: integer;
-  var ResultValue: TBESENValue);
+function TChakraProcess.writeLine(Arguments: PJsValueRefArray;
+  CountArguments: word): JsValueRef;
 var
   i: Integer;
   s: ansistring;
 begin
-  if (not Assigned(FProcess)) or (not Assigned(FDataHandler))then
+  result:=JsUndefinedValue;
+  if (not Assigned(FProcess)) or (not Assigned(FDataHandler)) or (CountArguments=0) then
     Exit;
 
   s:='';
   for i:=0 to CountArguments-1 do
   begin
     if i>0 then s:=s+' ';
-    s:=s + ansistring(TBESEN(Instance).ToStr(Arguments^[i]^));
+    s:=s + JsStringToUTF8String(JsValueAsJsString(Arguments^[i]));
   end;
-  s:=s+#10;
+  s:=s + #10;
   FProcess.Input.WriteBuffer(s[1], Length(s));
 end;
 
-procedure TChakraProcess.isTerminated(const ThisArgument: TBESENValue;
-  Arguments: PPBESENValues; CountArguments: integer;
-  var ResultValue: TBESENValue);
+function TChakraProcess.isTerminated(Arguments: PJsValueRefArray;
+  CountArguments: word): JsValueRef;
 begin
-  if Assigned(FProcess) then
-    resultValue:=BESENBooleanValue(not FProcess.Running)
-  else
-    resultValue:=BESENBooleanValue(True);
-end;         *)
+  Result:=BooleanToJsBoolean(GetTerminated);
+end;
 
 end.
 
